@@ -1,0 +1,161 @@
+* Boot tasks to treat Jupyter notebook as REPL
+
+NOTE:  There's no code here yet!  Anything that looks like code is merely an illusion.
+Only the README file makes any sense yet, and even that, maybe not so much just now.
+
+This project is an experiment to see if it's practical to treat Jupyter as a REPL.
+
+I want to explore whether it's of much use to have a standalone kernel associated with
+a [[http://boot-clj.com/][boot]]-enabled project, with classpath populated from the dependencies in your project's =build.boot=.
+This is worth asking because it's similar to the REPL model, which has proven
+to be rather useful.
+
+boot is interesting because it offers a way (pods) to control the environment
+in which notebooks will be evaluated, including their dependencies.
+Each notebook could potentially have its own pod, with its own set of dependencies.
+
+The boot task delegates the heavy lifting to the clojupyter code,
+which requires no modification.  (Well, one /tiny/ modification so
+the kernel won't exit when the notebook disconnects.)
+
+* How to use it
+
+*NOTE*: This is NOT IMPLEMENTED YET!
+
+The =jupyter= task works pretty much anywhere you can use the =repl= task.
+Whereas =repl= creates an nrepl listener that will respond to connections by nrepl clients,
+=jupyter= creates a special listener that will respond to connections from Jupyter notebooks.
+
+That listener will run as long as you leave it there.  It can serve many different
+notebook connections, and will outlast them (unless one of them tells it to shut down).
+
+When a notebook connects, it will get a standard Jupyter kernel that evaluates
+Clojure language expressions.
+
+First you have to install the shim program on the machine where you'll be running
+the Jupyter notebook server.  For now there's a shell script in this project to do that:
+
+#+BEGIN_SRC sh
+install-shim.sh 7777
+#+END_SRC
+
+The argument is the same port number we'll give to the jupyter task below.
+Just pick a port that's not in use already on your machine.
+(It's a workaround for difficulties in the way Jupyter notebook handles kernel discovery,
+as discussed below.)
+
+Merge this fragment into your =build.boot=:
+#+BEGIN_SRC clojure
+(set-env!
+ :dependencies '[[boot-clojupyter "0.1.0-SNAPSHOT"]] )
+
+(require '[clojupyter.tasks :refer (jupyter)])
+(task-options!
+   jupyter {
+       :shim-port 7777
+   }
+)
+#+END_SRC
+
+Then run
+#+BEGIN_SRC sh
+boot jupyter
+#+END_SRC
+
+* How it works
+
+** Jupyter notebook/kernel integration
+
+First, let's review how Jupyter starts and interacts with a kernel.
+
+For details, see [[http://jupyter-client.readthedocs.io/en/latest/kernels.html][Jupyter documentation on kernels]]. Here's a synopsis of the bits
+relevant to this effort.
+
+A kernel is simply a program that supports a particular language. Each supported
+language has a kernel.
+
+Each kernel must be installed in the notebook server. That is done by placing a
+couple of files in a directory where the notebook server will look for them.
+Jupyter scans that directory to discover what kernels are available, so it can
+offer them in its menu. When Jupyter decides it's time to start a kernel, it
+reads one of those files to find a command that will start the kernel. That
+command is expected to start listeners on TCP ports that are specified in the
+connection info file that is passed as an argument to the kernel program.
+
+Here are two scenarios we'd like to support. The first is the traditional one,
+where the notebook decides when to start the kernel. The second has a kernel
+running in a standalone process, started by other means before any notebook
+connects.
+
+** Notebooks start server when they need one
+
+This is the traditional way notebooks manage kernels, and it's the one best
+supported by the existing =clojupyter=. The file specifies to run an executable
+program named =clojupyter= with the name of a connection info file as its only
+argument. That program starts the JVM where the clojure code runs. It listens on
+the ports specified in the connection info, so it's ready when the notebook
+finally connects.
+
+** Start a standalone kernel, notebooks connect to it
+
+The =jupyter= boot task operates similarly to the =repl= task, in that
+it starts a listener in a context that a client may connect to,
+so that the client may evaluate clojure programs in a specified context.
+
+nREPL has it easy -- it just listens on a TCP port, and when something connects,
+it starts speaking nREPL protocol on it. That's one input stream, and one output
+stream, over which the client and server send each other a succession of maps.
+
+The Jupyter protocol isn't quite that simple.  It involves several TCP ports,
+and it speaks zeromq protocol over them.  That's not so hard to deal with,
+as it's essentially the same thing as nREPL, just with more ports.
+Also, the code to deal with them already exists.
+
+The most natural thing would be to start listeners on all those ports,
+and wait for the notebook to connect. But that's not the way notebooks work!
+
+The way Jupyter notebooks currently work, it's the notebook server that
+decides what ports the kernel should listen on.  It constructs a json
+file that lists the ports that the notebook intends to connect to,
+and then invokes the kernel's program with that file as argument.
+It expects that some time after that, the kernel will be listening
+on the specified ports.
+
+It would be great if we could simply start our kernel, using our own
+choice of ports, and somehow inform the notebook server to use those.
+There's doesn't seem to be an easy way to do this, though, without
+hacking the notebook implementation.
+
+We have to wait for a notebook to signal its intention to connect to a kernel,
+and on what ports it will do so.
+It will tell us that by invoking whatever program is listed in the kernel spec file,
+with the connection info file as its argument.
+For many kernels, that program actually does start the kernel, to listen on
+whatever ports are specified in the connection info file.
+
+In our case, the program we tell Jupyter to run is just a shim -- a small
+program that passes the connection info to the standalone kernel process that
+we'd previously started.  That kernel responds by starting to listen on
+the ports specified in the connection info.  Whenever the notebook gets
+around to trying to connect, we'll be ready.
+
+The boot task delegates the heavy lifting to the clojupyter code.
+All we do is to start the shim listener, the same way a repl would
+be started.  Other tasks can proceed.
+
+The shim listener listens on a tcp port for a connection from the shim program.
+When the notebook server runs the shim program, which will connect to our
+TCP port and send the json connection info.  We parse that json, which
+tells us all we need to know to start the normal clojupyter kernel.
+
+* Modifications to clojupyter
+
+clojupyter assumed that the notebook server would start the kernel,
+and it exited (System.exit) when the notebook disconnects.
+We'll have to do a tiny bit of refactoring to the clojupyter code so
+it can handle the long-lived kernel use case.
+
+
+* References
+   * [[https://lambdaisland.com/guides/clojure-repls/clojure-repls][Lambda Island's explanation of how Clojure REPLs work]]
+   * [[http://jupyter-client.readthedocs.io/en/latest/kernels.html][Jupyter documentation on kernels]]
